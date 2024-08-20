@@ -63,6 +63,7 @@ class DDIMwCG:
 
     """ DDIM model with classifier-guidance
      this class is used for inference of anomaly detection (not training)
+     对已经训练好的DM利用已经训练好的Classifier的梯度进行infer采样指导
     """
 
     def __init__(self, config):
@@ -72,19 +73,25 @@ class DDIMwCG:
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        ## 导入训练好的DM
         self.diffusion_model = DDIM(config)
         weights_path = os.path.join(config['ddim_log_dir'], "weights.pth")
         self.diffusion_model.load_state_dict(torch.load(weights_path))
         self.diffusion_model = self.diffusion_model.to(self.device).eval()
         self.diffusion_model = self.diffusion_model.diffusion_model
 
+        ## 导入训练好的分类器
         self.classifier = Classifier(config)
         weights_path = os.path.join(config['classifier_log_dir'], "weights.pth")
         self.classifier.load_state_dict(torch.load(weights_path))
         self.classifier = self.classifier.to(self.device).eval()
         self.classifier = self.classifier.classifier
 
+
+        ## scheduler决定了infer时的加噪方式
         self.scheduler = DDIMScheduler(num_train_timesteps=1000)
+
+        ## 这里的infer指的什么？
         self.inferer = DiffusionInferer(self.scheduler)
 
         self.L = self.config['L']      # noise level L
@@ -97,46 +104,72 @@ class DDIMwCG:
     def detect_anomaly(self, x: Tensor):
         """ detect anomaly using diffusion model with classifier-guidance """
         t_start = time()
-
         x = x.to(self.device)
         rec = x.clone()
         self.scheduler.set_timesteps(num_inference_steps=1000)
 
+        ## 这里存在一个差异，该模型是输入一个原图
+        ## 然后反转得到噪声图，对噪声图进行CG指导去噪
+        ## 我们的是纯噪声图由text指导生成任意图，CG指导的是text约束下任意图的生成
         print("\nnoising process...")
         progress_bar = tqdm(range(self.L-1))  # go back and forth L timesteps
         for t in progress_bar:  # go through the noising process
+            ## 自动混合精度autocase
             with autocast(enabled=False):
                 with torch.no_grad():
                     model_output = self.diffusion_model(rec, timesteps=torch.Tensor((t,)).to(rec.device))
             rec, _ = self.scheduler.reversed_step(model_output, t, rec)
             rec = torch.clamp(rec, -1, 1)
 
+
+        ## 下面才是真正的分类器指导去噪
         print("denoising process...")
+
+        ## 分类器标签
         y = torch.tensor(0)  # define the desired class label
         progress_bar = tqdm(range(self.L-1,-1,-1))  # go back and forth L timesteps
         for t in progress_bar:  # go through the denoising process
             # t = self.L - i
             with autocast(enabled=True):
                 with torch.no_grad():
+                    ## 对于输入的噪声图，经过DM预测噪声epsilon
                     model_output = self.diffusion_model(
                         rec, timesteps=torch.Tensor((t,)).to(rec.device)
                     ).detach()  # this is supposed to be epsilon
 
                 with torch.enable_grad():
+
+                    ## 将每一步的输入的噪声图作为分类器的输入
+                    ## detach获取rec的值, 创建新张量x_in，同时赋予x_in梯度属性
+                    ## 因为要利用分类器的输出的梯度影响每一步的预测噪声的结果
                     x_in = rec.detach().requires_grad_(True)
+
+                    ## 得到分类器的logits，概率
                     logits = self.classifier(x_in, timesteps=torch.Tensor((t,)).to(rec.device))
                     log_probs = F.log_softmax(logits, dim=-1)
+
+                    ## 关键一步，提取标签为1的概率大小
+                    ## 这个概率反映了输入数据趋向于正类的幅度，概率越大，说明输入的噪声图越像正样本
                     selected = log_probs[range(len(logits)), y.view(-1)]
 
                     # get gradient C(x_t) regarding x_t 
+
+                    ## 计算输入数据在标签为1的方向上的梯度a
                     a = torch.autograd.grad(selected.sum(), x_in)[0]
+
+                    ## 得到当前时间步的倍数因子alpha
                     alpha_prod_t = self.scheduler.alphas_cumprod[t]
+
+                    ## 利用标签1的梯度指导模型预测的噪声往梯度方向更新
+                    ## 自定义梯度的权重参数self.scale
                     updated_noise = (
                         model_output - (1 - alpha_prod_t).sqrt() * self.scale * a
                     )  # update the predicted noise epsilon with the gradient of the classifier
-
+            ## 利用每一步梯度优化后的预测噪声，来更新下一步的输入
             rec, _ = self.scheduler.step(updated_noise, t, rec)
             rec = torch.clamp(rec, -1, 1)
+
+            ## 清空CUDA缓存，释放所有未使用的GPU内存
             torch.cuda.empty_cache()
 
         # anomaly detection
@@ -151,7 +184,8 @@ class DDIMwCG:
 
 
 class DDIM(pl.LightningModule):
-
+    
+    ## 前向加噪，利用每一步的加噪图训练分类器
     """ DDIM (Denoising Diffusion Implicit Model) model 
      Class for training DDIM model.
     """
@@ -241,6 +275,7 @@ class Classifier(pl.LightningModule):
         self.classifier = get_classifier(config, load_weights)
         self.classifier.to(self.device)
 
+        ## 这里采用的是DDIM的前向加噪，但是DDIM一般为反向去噪
         self.scheduler = DDIMScheduler(num_train_timesteps=1000)
 
         self.optimizer = self.configure_optimizers()
